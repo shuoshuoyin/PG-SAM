@@ -1,6 +1,6 @@
 # PG-SAM: A Prior-Guided Algorithm for Main Map Area Extraction
 
-This repository provides the reproducible inference code for PG-SAM / MMA-SAM2. A reader can download the repository, install the Python dependencies, download the required SAM2.1 base checkpoint, and run segmentation on the bundled input images.
+This repository provides the reproducible inference code for PG-SAM. A reader can download the repository, install the Python dependencies, download the required SAM2.1 base checkpoint, and run segmentation on the bundled input images.
 
 The package includes the inference source code, SAM2 configuration files, sample input images, and the PG-SAM checkpoint used by default:
 
