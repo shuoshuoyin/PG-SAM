@@ -1,0 +1,13 @@
+recursive-include sam2/configs *.yaml
+recursive-include data *
+include checkpoints/pgsam_best_model.pt
+include check_package.py
+include DATA_CARD.md
+include infer.py
+include README.md
+include requirements.txt
+include run_inference.bat
+include run_inference.sh
+include model_info.json
+include LICENSE
+include LICENSE_cctorch

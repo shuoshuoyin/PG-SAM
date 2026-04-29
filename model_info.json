@@ -1,0 +1,31 @@
+{
+  "model_name": "PG-SAM / MMA-SAM2",
+  "checkpoint": "checkpoints/pgsam_best_model.pt",
+  "base_model": "SAM2.1 Hiera-L",
+  "base_checkpoint": "checkpoints/sam2.1_hiera_large.pt",
+  "selection_metric": "validation IoU",
+  "best_epoch": 182,
+  "validation_metrics": {
+    "iou": 0.9253641640507537,
+    "precision": 0.976975623370447,
+    "recall": 0.9459944582929085,
+    "f1": 0.9612349706229226,
+    "accuracy": 0.9676623106002578,
+    "macc": 0.9647976163590493
+  },
+  "test_metrics": {
+    "iou": 0.9074164377042749,
+    "precision": 0.9403770878121298,
+    "recall": 0.9628098761808199,
+    "f1": 0.9514607748780727,
+    "accuracy": 0.959639828379539,
+    "macc": 0.9601195107098095
+  },
+  "postprocess": {
+    "close_radius": 3,
+    "min_area_ratio": 0.001,
+    "boundary_band_radius": 2,
+    "boundary_prob_threshold": 0.62,
+    "edge_search_radius": 2
+  }
+}
