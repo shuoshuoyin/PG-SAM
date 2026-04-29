@@ -61,7 +61,7 @@ pip install -e .
 
 If PyTorch is not installed yet, install the PyTorch build that matches the local CUDA driver first, then run the command above. You can also pass custom weight paths with `--sam2-checkpoint` and `--pgsam-checkpoint`.
 
-Before running inference, download `sam2.1_hiera_large.pt` as described above. For the supplied paper checkpoint, `checkpoints/pgsam_best_model.pt` was selected by validation IoU at epoch 182.
+Before running inference, download `sam2.1_hiera_large.pt` as described above.
 
 ## Run The Bundled Inference
 
