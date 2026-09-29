@@ -1,63 +1,114 @@
-# PG-SAM: Main Map Area Extraction Demo
+# PG-SAM: A Prior-Guided Segmentation Framework for Main Map Area Extraction
 
-This repository contains the inference-only PG-SAM V6.1 Full demo: the model code, an inference checkpoint, and a small set of input maps. It does not contain training data, ground-truth masks, evaluation tables, or experimental outputs. The checkpoint retains only inference settings and trained weights; training state and evaluation records were removed.
+This repository provides the reproducible inference code for PG-SAM. A reader can download the repository, install the Python dependencies, download the required SAM2.1 base checkpoint, and run segmentation on the bundled input images.
 
-The default PG-SAM checkpoint is the V6.1 Full `manual400` seed-42 model at `checkpoints/pgsam_best_model.pt`. Its SHA-256 hash and inference settings are recorded in `model_info.json`.
+The package includes the inference source code, SAM2 configuration files, sample input images, and the PG-SAM checkpoint used by default:
 
-The SAM2.1 Hiera-Large base checkpoint is not redistributed here. Download `sam2.1_hiera_large.pt` from the [official model page](https://huggingface.co/facebook/sam2.1-hiera-large) and place it at `checkpoints/sam2.1_hiera_large.pt`.
+```text
+checkpoints/pgsam_best_model.pt
+```
+
+The SAM2.1 Hiera-L base checkpoint is not included in this GitHub repository. Download it from the Hugging Face model page and place it at:
+
+```text
+checkpoints/sam2.1_hiera_large.pt
+```
+
+Official download source:
+
+https://huggingface.co/facebook/sam2.1-hiera-large
+
+Download `sam2.1_hiera_large.pt` from the Hugging Face page above, then place it at:
+
+```text
+checkpoints/sam2.1_hiera_large.pt
+```
+
+Do not remove the `checkpoints/`, `sam2/`, or `map_sam2/` directories after placing the checkpoint if you want the package to run offline.
+
+The package ships with a few input images in `data/images/` so readers can verify that image loading, model inference, post-processing, and final mask export are wired correctly. `model_info.json` records information for the supplied checkpoint.
 
 ## Files
 
 ```text
-PG-SAM_demo/
-|-- infer.py               # inference entry point
-|-- check_package.py       # package and checkpoint check
-|-- model_info.json        # checkpoint identity and inference settings
-|-- setup.py
-|-- requirements.txt
-|-- run_inference.bat       # Windows example
-|-- run_inference.sh        # Linux/macOS example
-|-- checkpoints/           # PG-SAM weight; SAM2 weight downloaded separately
-|-- map_sam2/              # PG-SAM model and inference code
-|-- sam2/                  # SAM2 model code and configuration
-|-- tools/                 # inference-checkpoint export utility
-`-- data/images/          # input maps for a run check
+release-folder/
+|-- infer.py            # model inference
+|-- check_package.py    # package sanity check
+|-- model_info.json     # supplied checkpoint information
+|-- DATA_CARD.md        # bundled input-data description
+|-- setup.py            # editable local package installer
+|-- pyproject.toml
+|-- requirements.txt    # Python dependencies
+|-- run_inference.bat   # Windows example command
+|-- run_inference.sh    # Linux/macOS example command
+|-- checkpoints/        # PG-SAM weight; SAM2 base weight is downloaded separately
+|-- map_sam2/           # PG-SAM model code required for inference
+|-- sam2/               # SAM2 model code and configs required for inference
+`-- data/
+    `-- images/         # bundled input images to segment
 ```
 
 ## Setup
 
-Python 3.10 or newer is required. A CUDA GPU is recommended because the model uses SAM2.1 Hiera-Large. Install a PyTorch build compatible with your CUDA driver first, then run:
+The package requires Python 3.10 or newer. A CUDA GPU is recommended for practical runtime because the default model is SAM2.1 Hiera-L.
+
+Open a terminal inside the release folder, then install the local package and dependencies:
 
 ```bash
+cd path/to/release-folder
 pip install -e .
 ```
 
-After downloading the SAM2.1 base checkpoint, verify the package and both weights:
+If PyTorch is not installed yet, install the PyTorch build that matches the local CUDA driver first, then run the command above. You can also pass custom weight paths with `--sam2-checkpoint` and `--pgsam-checkpoint`.
+
+Before running inference, download `sam2.1_hiera_large.pt` as described above.
+
+## Run The Bundled Inference
+
+Windows:
+
+```bat
+run_inference.bat
+```
+
+Linux/macOS:
 
 ```bash
+bash run_inference.sh
+```
+
+Direct Python command:
+
+```bash
+python infer.py \
+  --image-dir data/images \
+  --output-dir outputs/inference_run
+```
+
+Outputs are written to:
+
+```text
+outputs/inference_run/
+`-- masks/
+```
+
+## Use Your Own Images
+
+```bash
+python infer.py \
+  --image-dir path/to/images \
+  --output-dir outputs/my_images
+```
+
+## Data Check
+
+```bash
+python check_package.py
 python check_package.py --check-weights
 ```
 
-## Run inference
+The second command also verifies that the default SAM2 and PG-SAM checkpoint files are present.
 
-On Windows, run `run_inference.bat`; on Linux/macOS, run `bash run_inference.sh`. The equivalent command is:
+## License And Third-Party Checkpoints
 
-```bash
-python infer.py
-```
-
-The default command processes `data/images/`. Final binary masks (0 for background, 255 for the main map area) are written to `outputs/inference_run/masks/`; run metadata is written to `outputs/inference_run/metadata/`. Generated files under `outputs/` are ignored by Git.
-
-To process your own map images:
-
-```bash
-python infer.py --image-dir path/to/images --output-dir outputs/my_images
-```
-
-Use `--image path/to/image.png` for a single image. Optional `--save-raw`, `--save-prob`, and `--save-overlay` flags export additional visualizations. `--sam2-checkpoint` and `--pgsam-checkpoint` select custom checkpoint paths.
-
-The default protocol follows the released checkpoint: resize to 1024 × 1024 by letterboxing, use SGN-generated point prompts and the learned implicit spatial prior, then apply decoder and boundary/full-resolution refinement. Masks are restored to each image's original dimensions. No box prompts are used.
-
-## Data and license
-
-The bundled images are input-only samples for checking that the demo runs; they are not an evaluation dataset. See `DATA_CARD.md` for details. Review the included licenses and the SAM2 model page before using or redistributing third-party components or weights.
+The SAM2.1 Hiera-L checkpoint is distributed by Meta. Please review the SAM2 license and model page before using or redistributing it. This repository does not upload `sam2.1_hiera_large.pt`; users should download it from the official source and keep it at `checkpoints/sam2.1_hiera_large.pt`.
