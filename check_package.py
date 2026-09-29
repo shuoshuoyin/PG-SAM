@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 
 
@@ -16,7 +18,11 @@ REQUIRED_SOURCE_FILES = [
     PACKAGE_ROOT / "infer.py",
     PACKAGE_ROOT / "map_sam2" / "modeling.py",
     PACKAGE_ROOT / "map_sam2" / "inference.py",
+    PACKAGE_ROOT / "map_sam2" / "safe_prompts.py",
+    PACKAGE_ROOT / "map_sam2" / "transforms.py",
     PACKAGE_ROOT / "sam2" / "build_sam.py",
+    PACKAGE_ROOT / "sam2" / "modeling" / "backbones" / "sgn.py",
+    PACKAGE_ROOT / "sam2" / "modeling" / "sam" / "mask_decoder.py",
     PACKAGE_ROOT / "sam2" / "configs" / "sam2.1" / "sam2.1_hiera_l.yaml",
 ]
 
@@ -61,6 +67,20 @@ def main() -> None:
                     print(f"[hint] Download SAM2.1 Hiera-L from: {SAM2_DOWNLOAD_URL}")
                     print(f"[hint] Save it as: {DEFAULT_SAM2_CHECKPOINT}")
                 ok = False
+        if DEFAULT_PGSAM_CHECKPOINT.is_file():
+            info_path = PACKAGE_ROOT / "model_info.json"
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            expected = info.get("checkpoint_sha256")
+            checksum = hashlib.sha256()
+            with DEFAULT_PGSAM_CHECKPOINT.open("rb") as handle:
+                for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                    checksum.update(block)
+            actual = checksum.hexdigest()
+            if not expected or actual != expected:
+                print(f"[mismatch] PG-SAM checkpoint SHA-256: {actual}")
+                ok = False
+            else:
+                print(f"[ok] PG-SAM checkpoint SHA-256: {actual}")
 
     if not ok:
         raise SystemExit(1)

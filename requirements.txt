@@ -6,3 +6,4 @@ iopath>=0.1.10
 omegaconf>=2.3.0
 scipy>=1.10.0
 opencv-python-headless>=4.7.0
+tqdm>=4.66.1

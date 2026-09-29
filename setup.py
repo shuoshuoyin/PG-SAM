@@ -3,8 +3,8 @@ from setuptools import find_packages, setup
 
 setup(
     name="pg-sam-inference",
-    version="1.0.0",
-    description="Self-contained PG-SAM / MMA-SAM2 inference package.",
+    version="1.1.0",
+    description="PG-SAM V6.1 Full inference demo.",
     packages=find_packages(include=["map_sam2", "map_sam2.*", "sam2", "sam2.*"]),
     include_package_data=True,
     package_data={"sam2": ["configs/**/*.yaml"]},
@@ -18,5 +18,6 @@ setup(
         "omegaconf>=2.3.0",
         "scipy>=1.10.0",
         "opencv-python-headless>=4.7.0",
+        "tqdm>=4.66.1",
     ],
 )

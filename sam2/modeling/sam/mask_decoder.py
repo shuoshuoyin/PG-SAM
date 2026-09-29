@@ -29,6 +29,9 @@ class MaskDecoder(nn.Module):
         stage1_in_channels: Optional[int] = None,  # 1/4 resolution feature channels
         stage2_in_channels: Optional[int] = None,  # 1/8 resolution feature channels
         implicit_prompt_in_dim: Optional[int] = None,
+        implicit_prompt_gate_floor: float = 0.0,
+        implicit_prompt_mode: str = "multiplicative",
+        highres_fusion_mode: str = "residual_additive",
         iou_prediction_use_sigmoid=False,
         dynamic_multimask_via_stability=False,
         dynamic_multimask_stability_delta=0.05,
@@ -56,6 +59,21 @@ class MaskDecoder(nn.Module):
         super().__init__()
         self.transformer_dim = transformer_dim
         self.transformer = transformer
+        self.implicit_prompt_gate_floor = float(implicit_prompt_gate_floor)
+        if not (0.0 <= self.implicit_prompt_gate_floor <= 1.0):
+            raise ValueError("implicit_prompt_gate_floor must be in [0, 1].")
+        self.implicit_prompt_mode = str(implicit_prompt_mode)
+        if self.implicit_prompt_mode not in {"multiplicative", "residual"}:
+            raise ValueError("implicit_prompt_mode must be 'multiplicative' or 'residual'.")
+        self.highres_fusion_mode = str(highres_fusion_mode)
+        if self.highres_fusion_mode not in {"legacy_concat", "residual_additive"}:
+            raise ValueError(
+                "highres_fusion_mode must be 'legacy_concat' or 'residual_additive'."
+            )
+        # Zero initialization makes the residual mode start as an identity
+        # mapping. It can then learn to enhance/suppress regions without an
+        # unreliable early SGN prior destroying pretrained SAM2 features.
+        self.implicit_prompt_residual_scale = nn.Parameter(torch.tensor(0.0))
 
         self.num_multimask_outputs = num_multimask_outputs
 
@@ -93,6 +111,11 @@ class MaskDecoder(nn.Module):
             self.conv_s1 = nn.Conv2d(
                 stage2_in_channels, transformer_dim // 4, kernel_size=1, stride=1
             )
+            # A zero logit gives a gate of exactly one, reproducing the
+            # pretrained SAM2 additive skip path at initialization.  Training
+            # can smoothly suppress or strengthen each feature level.
+            self.highres_gate_logit_s0 = nn.Parameter(torch.tensor(0.0))
+            self.highres_gate_logit_s1 = nn.Parameter(torch.tensor(0.0))
             # When concatenating skip features, fuse them back to match the
             # channel size expected by the next upsampling stage.
             self.fuse_s1 = nn.Sequential(
@@ -116,9 +139,9 @@ class MaskDecoder(nn.Module):
                 activation(),
             )
 
-            # Rebuild the upscaling path so we can concatenate skip features
-            # after each intermediate upsampling step.
-            self.output_upscaling = None
+            # Keep the legacy reconstruction branch instantiated for loading
+            # archived v4 checkpoints.  V5 uses the original pretrained
+            # output_upscaling modules above through residual_additive.
             self.dc1 = nn.ConvTranspose2d(
                 transformer_dim, transformer_dim // 4, kernel_size=2, stride=2
             )
@@ -162,6 +185,16 @@ class MaskDecoder(nn.Module):
                 implicit_prompt_in_dim, transformer_dim, kernel_size=1, bias=False
             )
 
+    def _implicit_prompt_gate(self, attention: torch.Tensor) -> torch.Tensor:
+        if self.implicit_prompt_mode == "multiplicative":
+            return self.implicit_prompt_gate_floor + (
+                1.0 - self.implicit_prompt_gate_floor
+            ) * attention
+
+        centered = attention - attention.mean(dim=(2, 3), keepdim=True)
+        scale = torch.tanh(self.implicit_prompt_residual_scale)
+        return (1.0 + scale * centered).clamp_min(0.1)
+
     def forward(
         self,
         image_embeddings: torch.Tensor,
@@ -170,7 +203,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         multimask_output: bool,
         repeat_image: bool,
-        high_res_features: Optional[List[torch.Tensor]] = None,
+        high_res_features: Optional[List[Optional[torch.Tensor]]] = None,
         implicit_prompt_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -211,26 +244,31 @@ class MaskDecoder(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-            image_embeddings = image_embeddings * attn_s3
+            gate_s3 = self._implicit_prompt_gate(attn_s3)
+            image_embeddings = image_embeddings * gate_s3
 
             # Gated skip-connections:
             # use the same SGN spatial prior to filter Stage-1/2 high-res features
             # before concatenation in the decoder upsampling path.
             if high_res_features is not None and len(high_res_features) == 2:
                 feat_s0, feat_s1 = high_res_features
-                gate_s0 = F.interpolate(
-                    spatial_attn,
-                    size=feat_s0.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                gate_s1 = F.interpolate(
-                    spatial_attn,
-                    size=feat_s1.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                high_res_features = [feat_s0 * gate_s0, feat_s1 * gate_s1]
+                if feat_s0 is not None:
+                    gate_s0 = F.interpolate(
+                        spatial_attn,
+                        size=feat_s0.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    feat_s0 = feat_s0 * self._implicit_prompt_gate(gate_s0)
+                if feat_s1 is not None:
+                    gate_s1 = F.interpolate(
+                        spatial_attn,
+                        size=feat_s1.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    feat_s1 = feat_s1 * self._implicit_prompt_gate(gate_s1)
+                high_res_features = [feat_s0, feat_s1]
 
         masks, iou_pred, mask_tokens_out, object_score_logits = self.predict_masks(
             image_embeddings=image_embeddings,
@@ -241,10 +279,19 @@ class MaskDecoder(nn.Module):
             high_res_features=high_res_features,
         )
 
-        # Always output a single mask token (single high-resolution binary mask in downstream usage).
-        masks = masks[:, 0:1, :, :]
-        iou_pred = iou_pred[:, 0:1]
-        sam_tokens_out = mask_tokens_out[:, 0:1]  # (B,1,C)
+        if multimask_output:
+            mask_slice = slice(1, None)
+            masks = masks[:, mask_slice, :, :]
+            iou_pred = iou_pred[:, mask_slice]
+            sam_tokens_out = mask_tokens_out[:, mask_slice]
+        elif self.dynamic_multimask_via_stability and not self.training:
+            masks, iou_pred = self._dynamic_multimask_via_stability(masks, iou_pred)
+            sam_tokens_out = mask_tokens_out[:, 0:1]
+        else:
+            mask_slice = slice(0, 1)
+            masks = masks[:, mask_slice, :, :]
+            iou_pred = iou_pred[:, mask_slice]
+            sam_tokens_out = mask_tokens_out[:, mask_slice]
 
         # Prepare output
         return masks, iou_pred, sam_tokens_out, object_score_logits
@@ -256,7 +303,7 @@ class MaskDecoder(nn.Module):
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
-        high_res_features: Optional[List[torch.Tensor]] = None,
+        high_res_features: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -309,21 +356,35 @@ class MaskDecoder(nn.Module):
                 )
             feat_s0, feat_s1 = high_res_features
 
-            # Stage-2 (1/8 res): fuse at the intermediate upsampling step.
-            # Support both raw (transformer_dim channels) and pre-projected features.
-            if feat_s0.shape[1] == self.conv_s0.in_channels:
-                feat_s0 = self.conv_s0(feat_s0)
-            if feat_s1.shape[1] == self.conv_s1.in_channels:
-                feat_s1 = self.conv_s1(feat_s1)
-
-            up1 = self.dc1(src)  # (B, C/4, 2H, 2W)
-            up1 = self.act1(self.ln1(up1))
-            up1 = self.fuse_s1(torch.cat([up1, feat_s1], dim=1))
-
-            # Stage-1 (1/4 res): fuse at the final upsampling step.
-            up2 = self.dc2(up1)  # (B, C/8, 4H, 4W)
-            up2 = self.act2(up2)
-            upscaled_embedding = self.fuse_s0(torch.cat([up2, feat_s0], dim=1))
+            if self.highres_fusion_mode == "legacy_concat":
+                if feat_s0 is None or feat_s1 is None:
+                    raise ValueError("legacy_concat requires two tensor feature maps.")
+                if feat_s0.shape[1] == self.conv_s0.in_channels:
+                    feat_s0 = self.conv_s0(feat_s0)
+                if feat_s1.shape[1] == self.conv_s1.in_channels:
+                    feat_s1 = self.conv_s1(feat_s1)
+                up1 = self.act1(self.ln1(self.dc1(src)))
+                up1 = self.fuse_s1(torch.cat([up1, feat_s1], dim=1))
+                up2 = self.act2(self.dc2(up1))
+                upscaled_embedding = self.fuse_s0(torch.cat([up2, feat_s0], dim=1))
+            else:
+                # Restore SAM2's pretrained additive upscaling path.  Missing
+                # feature levels are skipped entirely, so "none" is a true
+                # no-high-resolution-feature control without projection bias.
+                up1 = self.output_upscaling[0](src)
+                if feat_s1 is not None:
+                    if feat_s1.shape[1] == self.conv_s1.in_channels:
+                        feat_s1 = self.conv_s1(feat_s1)
+                    gate_s1 = 2.0 * torch.sigmoid(self.highres_gate_logit_s1)
+                    up1 = up1 + gate_s1 * feat_s1
+                up1 = self.output_upscaling[2](self.output_upscaling[1](up1))
+                up2 = self.output_upscaling[3](up1)
+                if feat_s0 is not None:
+                    if feat_s0.shape[1] == self.conv_s0.in_channels:
+                        feat_s0 = self.conv_s0(feat_s0)
+                    gate_s0 = 2.0 * torch.sigmoid(self.highres_gate_logit_s0)
+                    up2 = up2 + gate_s0 * feat_s0
+                upscaled_embedding = self.output_upscaling[4](up2)
 
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):

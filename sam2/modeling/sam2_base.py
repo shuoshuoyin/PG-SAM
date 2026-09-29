@@ -200,8 +200,8 @@ class SAM2Base(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
-            "SAM2Base is not intended to be called directly in this release package. "
-            "Use infer.py, which calls the PG-SAM image inference path explicitly."
+            "Please use the corresponding methods in SAM2VideoPredictor for inference or SAM2Train for training/fine-tuning"
+            "See notebooks/video_predictor_example.ipynb for an inference example."
         )
 
     def _build_sam_heads(self):
@@ -511,7 +511,7 @@ class SAM2Base(torch.nn.Module):
         feat_sizes,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for interactive use)
+        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
     ):
         """Fuse the current frame's visual feature map with previous memory."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
@@ -578,7 +578,7 @@ class SAM2Base(torch.nn.Module):
             for t_pos, prev in t_pos_and_prevs:
                 if prev is None:
                     continue  # skip padding frames
-                # "maskmem_features" might have been offloaded to CPU in interactive use cases,
+                # "maskmem_features" might have been offloaded to CPU in demo use cases,
                 # so we load it back to GPU (it's a no-op if it's already on GPU).
                 feats = prev["maskmem_features"].to(device, non_blocking=True)
                 to_cat_memory.append(feats.flatten(2).permute(2, 0, 1))
@@ -778,7 +778,7 @@ class SAM2Base(torch.nn.Module):
             )
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
-            # e.g. in interactive use where such logits come from earlier interaction instead of correction sampling
+            # e.g. in demo where such logits come from earlier interaction instead of correction sampling
             # (in this case, any `mask_inputs` shouldn't reach here as they are sent to _use_mask_as_output instead)
             if prev_sam_mask_logits is not None:
                 assert point_inputs is not None and mask_inputs is None
@@ -830,14 +830,14 @@ class SAM2Base(torch.nn.Module):
         mask_inputs,
         output_dict,
         num_frames,
-        track_in_reverse=False,  # tracking in reverse time order (for interactive use)
+        track_in_reverse=False,  # tracking in reverse time order (for demo usage)
         # Whether to run the memory encoder on the predicted masks. Sometimes we might want
         # to skip the memory encoder with `run_mem_encoder=False`. For example,
-        # in interactive use we might call `track_step` multiple times for each user click,
+        # in demo we might call `track_step` multiple times for each user click,
         # and only encode the memory when the user finalizes their clicks. And in ablation
         # settings like SAM training on static images, we don't need the memory encoder.
         run_mem_encoder=True,
-        # The previously predicted SAM mask logits (which can be fed together with new clicks in interactive use).
+        # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
@@ -869,7 +869,7 @@ class SAM2Base(torch.nn.Module):
         current_out["obj_ptr"] = obj_ptr
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;
-            # it is mainly used in interactive inference to encode spatial memories with consolidated masks)
+            # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
             current_out["object_score_logits"] = object_score_logits
 
         # Finally run the memory encoder on the predicted mask to encode

@@ -1,6 +1,6 @@
-"""Geometry and post-processing helpers used by the MMA-SAM2 pipeline."""
+"""Geometry and post-processing helpers used by the PGSAM pipeline."""
 
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -165,105 +165,93 @@ def heatmap_to_points_xy(
     point_min_conf_ratio: float = 0.3,
     restrict_to_main_component: bool = True,
 ) -> torch.Tensor:
+    """Convert a non-differentiable SGN heatmap into well-spaced point prompts.
+
+    Point selection intentionally runs from one small CPU snapshot of each 64x64
+    heatmap.  The previous implementation repeatedly called ``.item()`` inside
+    Python loops, forcing hundreds of CUDA synchronizations per batch.
+    """
     if heatmap_64.dim() != 4 or heatmap_64.shape[1] != 1:
         raise ValueError(f"heatmap_64 must be (B,1,H,W), got {heatmap_64.shape}")
     b, _, h, w = heatmap_64.shape
     if h != 64 or w != 64:
         raise ValueError(f"heatmap_64 must be 64x64, got {(h, w)}")
+    num_points = int(num_points)
+    if num_points < 1:
+        raise ValueError("num_points must be >= 1")
 
-    weights = heatmap_64.squeeze(1).clamp(min=0.0)
-    if restrict_to_main_component:
-        weights = weights * largest_component_mask(weights, min_conf_ratio=heatmap_min_conf_ratio)
-    denom = weights.sum(dim=(1, 2)) + eps
-    max_w = weights.amax(dim=(1, 2))
-    conf_ok = max_w >= float(heatmap_min_conf_ratio)
-
-    grid_y = torch.arange(h, device=weights.device, dtype=weights.dtype).view(h, 1).expand(h, w)
-    grid_x = torch.arange(w, device=weights.device, dtype=weights.dtype).view(1, w).expand(h, w)
-
-    centroid_x = (weights * grid_x).sum(dim=(1, 2)) / denom
-    centroid_y = (weights * grid_y).sum(dim=(1, 2)) / denom
-    small = denom <= eps * 10.0
-    centroid_x = torch.where(small, torch.full_like(centroid_x, (w - 1) / 2.0), centroid_x)
-    centroid_y = torch.where(small, torch.full_like(centroid_y, (h - 1) / 2.0), centroid_y)
-
-    x0_abs = centroid_x / (w - 1) * float(img_size)
-    y0_abs = centroid_y / (h - 1) * float(img_size)
-
-    points = torch.zeros((b, int(num_points), 2), device=heatmap_64.device, dtype=heatmap_64.dtype)
-    points[:, 0, 0] = x0_abs
-    points[:, 0, 1] = y0_abs
-
-    k = max(0, min(int(num_points) - 1, h * w))
-    if k == 0:
-        return points.clamp(0.0, float(img_size))
-
-    cand_k = min(h * w, max(1, int(k) * int(heatmap_topk_mult)))
-    flat = weights.reshape(b, -1)
-    topk_idx_all = torch.topk(flat, k=cand_k, dim=1).indices
-
+    weights_batch = heatmap_64.detach().float().cpu().numpy()[:, 0]
+    points_np = np.zeros((b, num_points, 2), dtype=np.float32)
+    grid_y, grid_x = np.mgrid[0:h, 0:w]
     min_d2 = float(min_dist_px * min_dist_px)
-    for i in range(b):
-        if not bool(conf_ok[i].item()):
-            points[i, :, 0] = x0_abs[i]
-            points[i, :, 1] = y0_abs[i]
+    extra_points = min(num_points - 1, h * w)
+    candidate_count = min(h * w, max(1, extra_points * int(heatmap_topk_mult)))
+
+    for batch_idx in range(b):
+        weights = np.clip(weights_batch[batch_idx], 0.0, None)
+        max_weight = float(weights.max())
+        if restrict_to_main_component and max_weight > 0.0:
+            component = _largest_component_np(
+                weights >= max_weight * float(heatmap_min_conf_ratio)
+            )
+            if component is not None:
+                weights = weights * component.astype(weights.dtype)
+
+        denom = float(weights.sum())
+        if denom <= eps * 10.0:
+            centroid_x = (w - 1) / 2.0
+            centroid_y = (h - 1) / 2.0
+        else:
+            centroid_x = float((weights * grid_x).sum() / (denom + eps))
+            centroid_y = float((weights * grid_y).sum() / (denom + eps))
+
+        points_np[batch_idx, :, 0] = centroid_x
+        points_np[batch_idx, :, 1] = centroid_y
+        if extra_points == 0 or max_weight < float(heatmap_min_conf_ratio):
             continue
-        accepted = [(float(centroid_x[i].detach().cpu().item()), float(centroid_y[i].detach().cpu().item()))]
-        cur = 1
-        conf_thresh = float(max_w[i].detach().cpu().item()) * float(point_min_conf_ratio)
-        for j in range(int(topk_idx_all.shape[1])):
-            if cur >= int(num_points):
+
+        flat = weights.reshape(-1)
+        sorted_indices = np.argsort(-flat, kind="stable")[:candidate_count]
+        confidence_threshold = max_weight * float(point_min_conf_ratio)
+        accepted = [(centroid_x, centroid_y)]
+        current = 1
+        for flat_idx in sorted_indices.tolist():
+            if current >= num_points:
                 break
-            idx = topk_idx_all[i, j].detach().cpu().item()
-            if float(flat[i, idx].detach().cpu().item()) < conf_thresh:
+            if float(flat[flat_idx]) < confidence_threshold:
                 continue
-            y = float(idx // w)
-            x = float(idx % w)
-            ok = True
-            for ax, ay in accepted:
-                dx = x - ax
-                dy = y - ay
-                if dx * dx + dy * dy < min_d2:
-                    ok = False
-                    break
-            if not ok:
+            y, x = divmod(int(flat_idx), w)
+            if min((x - ax) ** 2 + (y - ay) ** 2 for ax, ay in accepted) < min_d2:
                 continue
-            points[i, cur, 0] = x / (w - 1) * float(img_size)
-            points[i, cur, 1] = y / (h - 1) * float(img_size)
-            accepted.append((x, y))
-            cur += 1
+            points_np[batch_idx, current] = (float(x), float(y))
+            accepted.append((float(x), float(y)))
+            current += 1
 
-        if cur < int(num_points):
-            positive_idx = torch.nonzero(flat[i] > 0, as_tuple=False).flatten()
-            positive_idx_cpu = positive_idx.detach().cpu().tolist()
-            max_val = float(max_w[i].detach().cpu().item()) + eps
-            while cur < int(num_points) and positive_idx_cpu:
-                best_idx = None
-                best_score = -1.0
-                for idx in positive_idx_cpu:
-                    y = float(idx // w)
-                    x = float(idx % w)
-                    min_d2_to_accepted = min((x - ax) * (x - ax) + (y - ay) * (y - ay) for ax, ay in accepted)
-                    if min_d2_to_accepted < 1.0:
-                        continue
-                    weight = float(flat[i, idx].detach().cpu().item()) / max_val
-                    score = min_d2_to_accepted * (0.25 + 0.75 * weight)
-                    if score > best_score:
-                        best_score = score
-                        best_idx = idx
-                if best_idx is None:
+        positive_indices = np.flatnonzero(flat > 0.0)
+        if current < num_points and positive_indices.size > 0:
+            positive_y, positive_x = np.divmod(positive_indices, w)
+            positive_xy = np.stack([positive_x, positive_y], axis=1).astype(np.float32)
+            normalized_weights = flat[positive_indices] / (max_weight + eps)
+            while current < num_points:
+                accepted_np = np.asarray(accepted, dtype=np.float32)
+                distances = ((positive_xy[:, None, :] - accepted_np[None, :, :]) ** 2).sum(axis=2)
+                nearest_d2 = distances.min(axis=1)
+                scores = nearest_d2 * (0.25 + 0.75 * normalized_weights)
+                scores[nearest_d2 < 1.0] = -1.0
+                best_position = int(np.argmax(scores))
+                if float(scores[best_position]) < 0.0:
                     break
-                y = float(best_idx // w)
-                x = float(best_idx % w)
-                points[i, cur, 0] = x / (w - 1) * float(img_size)
-                points[i, cur, 1] = y / (h - 1) * float(img_size)
-                accepted.append((x, y))
-                cur += 1
+                x, y = positive_xy[best_position]
+                points_np[batch_idx, current] = (x, y)
+                accepted.append((float(x), float(y)))
+                current += 1
 
-        if cur < int(num_points):
-            points[i, cur:, 0] = x0_abs[i]
-            points[i, cur:, 1] = y0_abs[i]
-    return points.clamp(0.0, float(img_size))
+    points_np[..., 0] = points_np[..., 0] / float(w - 1) * float(img_size)
+    points_np[..., 1] = points_np[..., 1] / float(h - 1) * float(img_size)
+    return torch.from_numpy(points_np).to(
+        device=heatmap_64.device,
+        dtype=heatmap_64.dtype,
+    ).clamp(0.0, float(img_size))
 
 
 def largest_component_mask(weights: torch.Tensor, min_conf_ratio: float = 0.05) -> torch.Tensor:
@@ -271,7 +259,7 @@ def largest_component_mask(weights: torch.Tensor, min_conf_ratio: float = 0.05) 
     if weights.dim() != 3:
         raise ValueError(f"weights must be (B,H,W), got {weights.shape}")
 
-    b, h, w = weights.shape
+    b, _, _ = weights.shape
     out = torch.zeros_like(weights, dtype=torch.float32)
     weights_cpu = weights.detach().float().cpu().numpy()
 
@@ -295,7 +283,7 @@ def clean_binary_region(mask: torch.Tensor, erode_radius: int = 1) -> torch.Tens
 
     b, _, h, w = mask.shape
     out = torch.zeros((b, 1, h, w), device=mask.device, dtype=torch.float32)
-    mask_cpu = (mask.detach().float().cpu().numpy()[:, 0] > 0.5)
+    mask_cpu = mask.detach().float().cpu().numpy()[:, 0] > 0.5
 
     for i in range(b):
         component = _largest_filled_component_np(mask_cpu[i])
@@ -354,7 +342,7 @@ def _largest_filled_component_np(mask: np.ndarray) -> np.ndarray | None:
     ff_mask = np.zeros((component_u8.shape[0] + 2, component_u8.shape[1] + 2), np.uint8)
     cv2.floodFill(flood, ff_mask, (0, 0), 255)
     holes = cv2.bitwise_not(flood)
-    return (cv2.bitwise_or(component_u8, holes) > 0)
+    return cv2.bitwise_or(component_u8, holes) > 0
 
 
 def _erode_np(mask: np.ndarray, radius: int) -> np.ndarray | None:
@@ -370,15 +358,23 @@ def _erode_np(mask: np.ndarray, radius: int) -> np.ndarray | None:
 
     if cv2 is None:
         return mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * radius + 1, 2 * radius + 1),
+    )
     return cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
 
-def select_high_res_features(neck_feats: Sequence[torch.Tensor], enabled: bool, mode: str) -> List[torch.Tensor]:
+def select_high_res_features(
+    neck_feats: Sequence[torch.Tensor],
+    enabled: bool,
+    mode: str,
+    absent_as_none: bool = False,
+) -> List[Optional[torch.Tensor]]:
     s0 = neck_feats[0]
     s1 = neck_feats[1]
-    z0 = torch.zeros_like(s0)
-    z1 = torch.zeros_like(s1)
+    z0 = None if absent_as_none else torch.zeros_like(s0)
+    z1 = None if absent_as_none else torch.zeros_like(s1)
     if not enabled or mode == "none":
         return [z0, z1]
     if mode == "stage1":
@@ -390,55 +386,43 @@ def select_high_res_features(neck_feats: Sequence[torch.Tensor], enabled: bool, 
     raise ValueError(f"Unsupported high_res feature mode: {mode}")
 
 
-def masks_to_boxes_xyxy(mask: torch.Tensor) -> torch.Tensor:
-    b, _, h, w = mask.shape
-    boxes = torch.zeros((b, 4), device=mask.device, dtype=torch.float32)
-    m = (mask > 0.5).squeeze(1)
-    for i in range(b):
-        ys, xs = torch.where(m[i])
-        if ys.numel() == 0:
-            boxes[i] = torch.tensor([0.0, 0.0, float(w - 1), float(h - 1)], device=mask.device)
-            continue
-        boxes[i] = torch.stack([xs.min().float(), ys.min().float(), xs.max().float(), ys.max().float()], dim=0)
-    return boxes
+def masks_to_interior_points_xy(mask: torch.Tensor, work_size: int = 64) -> torch.Tensor:
+    """Return a foreground point near the maximum interior distance of each mask."""
 
+    if mask.dim() != 4 or mask.shape[1] != 1:
+        raise ValueError(f"mask must be (B,1,H,W), got {mask.shape}")
+    work_size = max(8, int(work_size))
+    batch_size, _, height, width = mask.shape
+    small = F.interpolate(mask.float(), size=(work_size, work_size), mode="nearest")
+    small_np = (small.detach().cpu().numpy()[:, 0] > 0.5).astype(np.uint8)
+    points = np.zeros((batch_size, 2), dtype=np.float32)
 
-def boxes_to_centers_xy(boxes_xyxy: torch.Tensor) -> torch.Tensor:
-    cx = 0.5 * (boxes_xyxy[:, 0] + boxes_xyxy[:, 2])
-    cy = 0.5 * (boxes_xyxy[:, 1] + boxes_xyxy[:, 3])
-    return torch.stack([cx, cy], dim=1)
+    for batch_idx, binary in enumerate(small_np):
+        if int(binary.sum()) == 0:
+            x_small = (work_size - 1) * 0.5
+            y_small = (work_size - 1) * 0.5
+        else:
+            distance = None
+            try:
+                import scipy.ndimage as ndimage  # type: ignore
 
+                distance = ndimage.distance_transform_edt(binary.astype(bool))
+            except Exception:
+                if cv2 is not None:
+                    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+            if distance is None:
+                ys, xs = np.nonzero(binary)
+                x_small = float(xs.mean())
+                y_small = float(ys.mean())
+            else:
+                max_distance = float(distance.max())
+                deepest_y, deepest_x = np.nonzero(
+                    distance >= max_distance - max(1e-6, max_distance * 1e-6)
+                )
+                x_small = float(deepest_x.mean())
+                y_small = float(deepest_y.mean())
 
-def box_iou_xyxy(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    x1 = torch.maximum(box1[:, 0], box2[:, 0])
-    y1 = torch.maximum(box1[:, 1], box2[:, 1])
-    x2 = torch.minimum(box1[:, 2], box2[:, 2])
-    y2 = torch.minimum(box1[:, 3], box2[:, 3])
-    inter_w = (x2 - x1).clamp(min=0)
-    inter_h = (y2 - y1).clamp(min=0)
-    inter = inter_w * inter_h
-    area1 = (box1[:, 2] - box1[:, 0]).clamp(min=0) * (box1[:, 3] - box1[:, 1]).clamp(min=0)
-    area2 = (box2[:, 2] - box2[:, 0]).clamp(min=0) * (box2[:, 3] - box2[:, 1]).clamp(min=0)
-    union = area1 + area2 - inter
-    return (inter + eps) / (union + eps)
+        points[batch_idx, 0] = x_small / float(work_size - 1) * float(width - 1)
+        points[batch_idx, 1] = y_small / float(work_size - 1) * float(height - 1)
 
-
-def generalized_box_iou_loss(box1: torch.Tensor, box2: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    x1 = torch.maximum(box1[:, 0], box2[:, 0])
-    y1 = torch.maximum(box1[:, 1], box2[:, 1])
-    x2 = torch.minimum(box1[:, 2], box2[:, 2])
-    y2 = torch.minimum(box1[:, 3], box2[:, 3])
-    inter = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
-
-    area1 = (box1[:, 2] - box1[:, 0]).clamp(min=0) * (box1[:, 3] - box1[:, 1]).clamp(min=0)
-    area2 = (box2[:, 2] - box2[:, 0]).clamp(min=0) * (box2[:, 3] - box2[:, 1]).clamp(min=0)
-    union = area1 + area2 - inter
-    iou = (inter + eps) / (union + eps)
-
-    cx1 = torch.minimum(box1[:, 0], box2[:, 0])
-    cy1 = torch.minimum(box1[:, 1], box2[:, 1])
-    cx2 = torch.maximum(box1[:, 2], box2[:, 2])
-    cy2 = torch.maximum(box1[:, 3], box2[:, 3])
-    c_area = (cx2 - cx1).clamp(min=0) * (cy2 - cy1).clamp(min=0)
-    giou = iou - (c_area - union) / (c_area + eps)
-    return (1.0 - giou).mean()
+    return torch.from_numpy(points).to(device=mask.device, dtype=mask.dtype)

@@ -1,4 +1,4 @@
-"""Model-side building blocks and trainable-module assembly for MMA-SAM2."""
+"""Model-side building blocks and trainable-module assembly for PGSAM."""
 
 import math
 from typing import Dict, List, Optional, Tuple
@@ -17,13 +17,17 @@ class BoundaryRefinementModule(nn.Module):
         self,
         stage1_in_channels: int,
         attn_dim: int = 64,
+        local_kernel: int = 5,
         downsample_ratio: int = 2,
         use_checkpoint: bool = True,
     ) -> None:
         super().__init__()
         if downsample_ratio < 1:
             raise ValueError("downsample_ratio must be >= 1.")
+        if local_kernel < 1 or local_kernel % 2 == 0:
+            raise ValueError("local_kernel must be a positive odd integer.")
         self.attn_dim = int(attn_dim)
+        self.local_kernel = int(local_kernel)
         self.downsample_ratio = int(downsample_ratio)
         self.use_checkpoint = bool(use_checkpoint)
 
@@ -59,6 +63,14 @@ class BoundaryRefinementModule(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(self.attn_dim, 1, kernel_size=1, bias=True),
         )
+        nn.init.zeros_(self.refine_head[-1].weight)
+        nn.init.zeros_(self.refine_head[-1].bias)
+        lap_kernel = torch.tensor(
+            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("lap_kernel", lap_kernel, persistent=False)
+        self.last_debug: Dict[str, torch.Tensor] = {}
 
     def _residual_ms_block(self, x: torch.Tensor) -> torch.Tensor:
         b1 = self.atrous1(x)
@@ -69,23 +81,33 @@ class BoundaryRefinementModule(nn.Module):
 
     def _boundary_focus(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
-        lap_kernel = torch.tensor(
-            [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
-            device=logits.device,
-            dtype=logits.dtype,
-        ).view(1, 1, 3, 3)
-        edge = F.conv2d(probs, lap_kernel, padding=1).abs()
-        edge = F.avg_pool2d(edge, kernel_size=5, stride=1, padding=2)
+        edge = F.conv2d(probs, self.lap_kernel.to(dtype=logits.dtype), padding=1).abs()
+        edge = F.avg_pool2d(
+            edge,
+            kernel_size=self.local_kernel,
+            stride=1,
+            padding=self.local_kernel // 2,
+        )
         e_min = edge.amin(dim=(2, 3), keepdim=True)
         e_max = edge.amax(dim=(2, 3), keepdim=True)
         return (edge - e_min) / (e_max - e_min + 1e-6)
 
     def _boundary_mask(self, logits: torch.Tensor) -> torch.Tensor:
         probs = torch.sigmoid(logits)
-        pred_bin = (probs > 0.5).float()
-        eroded = 1.0 - F.max_pool2d(1.0 - pred_bin, kernel_size=3, stride=1, padding=1)
-        boundary = (pred_bin - eroded).clamp_(0.0, 1.0)
-        return F.max_pool2d(boundary, kernel_size=5, stride=1, padding=2)
+        # A differentiable, symmetric uncertainty band lets the refiner move
+        # the contour both inward and outward. The previous hard 0.5 mask
+        # blocked gradients and could not recover regions omitted upstream.
+        uncertainty = 4.0 * probs * (1.0 - probs)
+        local_edge = F.max_pool2d(probs, 3, stride=1, padding=1) - (
+            1.0 - F.max_pool2d(1.0 - probs, 3, stride=1, padding=1)
+        )
+        boundary = torch.maximum(uncertainty, local_edge.clamp(0.0, 1.0))
+        return F.max_pool2d(
+            boundary,
+            kernel_size=self.local_kernel,
+            stride=1,
+            padding=self.local_kernel // 2,
+        )
 
     def forward(self, low_res_logits: torch.Tensor, stage1_feat: torch.Tensor) -> torch.Tensor:
         target_hw = low_res_logits.shape[-2:]
@@ -122,8 +144,17 @@ class BoundaryRefinementModule(nn.Module):
         delta = self.refine_head(local_ctx) * boundary_mask
         if self.downsample_ratio > 1:
             delta = F.interpolate(delta, size=target_hw, mode="bilinear", align_corners=False)
-            boundary_mask = F.interpolate(boundary_mask, size=target_hw, mode="nearest")
+            boundary_mask = F.interpolate(
+                boundary_mask, size=target_hw, mode="bilinear", align_corners=False
+            )
         delta = delta * boundary_mask
+        self.last_debug = {
+            "refiner_boundary_focus_mean": boundary_focus.detach().mean(),
+            "refiner_boundary_focus_max": boundary_focus.detach().max(),
+            "refiner_boundary_mask_ratio": boundary_mask.detach().mean(),
+            "refiner_delta_abs_mean": delta.detach().abs().mean(),
+            "refiner_delta_abs_max": delta.detach().abs().max(),
+        }
         return low_res_logits + delta
 
 
@@ -145,21 +176,82 @@ class GeometricResidualBlock(nn.Module):
         return self.act(x + y)
 
 
-class FullResGeometricAligner(nn.Module):
-    def __init__(self, in_channels: int = 7, hidden_channels: int = 48, num_blocks: int = 5):
+class DepthwiseGeometricResidualBlock(nn.Module):
+    """Full-resolution residual block with substantially lower memory and FLOPs."""
+
+    def __init__(self, channels: int):
         super().__init__()
+        self.depthwise1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=False,
+        )
+        self.pointwise1 = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.norm1 = nn.GroupNorm(1, channels)
+        self.depthwise2 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=False,
+        )
+        self.pointwise2 = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.norm2 = nn.GroupNorm(1, channels)
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.pointwise1(self.depthwise1(x))
+        y = self.act(self.norm1(y))
+        y = self.pointwise2(self.depthwise2(y))
+        y = self.norm2(y)
+        return self.act(x + y)
+
+
+class FullResGeometricAligner(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 7,
+        hidden_channels: int = 48,
+        num_blocks: int = 5,
+        block_type: str = "standard",
+    ):
+        super().__init__()
+        if block_type not in {"standard", "depthwise"}:
+            raise ValueError("block_type must be 'standard' or 'depthwise'.")
+        self.block_type = block_type
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(1, hidden_channels),
             nn.GELU(),
         )
-        self.blocks = nn.Sequential(*[GeometricResidualBlock(hidden_channels) for _ in range(int(num_blocks))])
+        block_cls = (
+            DepthwiseGeometricResidualBlock
+            if block_type == "depthwise"
+            else GeometricResidualBlock
+        )
+        self.blocks = nn.Sequential(*[block_cls(hidden_channels) for _ in range(int(num_blocks))])
         self.head = nn.Sequential(
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(1, hidden_channels),
             nn.GELU(),
             nn.Conv2d(hidden_channels, 1, kernel_size=1, bias=True),
         )
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
 
     @staticmethod
     def _sobel_rgb(image: torch.Tensor) -> torch.Tensor:
@@ -186,12 +278,26 @@ class FullResGeometricAligner(nn.Module):
         std = torch.sqrt(var + 1e-6)
         return std.mean(dim=1, keepdim=True)
 
-    def forward(self, coarse_logits_1024: torch.Tensor, image_1024: torch.Tensor) -> torch.Tensor:
-        prob = torch.sigmoid(coarse_logits_1024)
-        sobel = self._sobel_rgb(image_1024)
-        hf = F.max_pool2d(sobel, kernel_size=3, stride=1, padding=1)
+    def prepare_image_context(self, image_1024: torch.Tensor) -> torch.Tensor:
+        sobel_x = self.sobel_x.to(dtype=image_1024.dtype)
+        sobel_y = self.sobel_y.to(dtype=image_1024.dtype)
+        gx = F.conv2d(image_1024, sobel_x.repeat(3, 1, 1, 1), padding=1, groups=3)
+        gy = F.conv2d(image_1024, sobel_y.repeat(3, 1, 1, 1), padding=1, groups=3)
+        sobel = torch.sqrt(gx * gx + gy * gy + 1e-6).amax(dim=1, keepdim=True)
+        high_frequency = F.max_pool2d(sobel, kernel_size=3, stride=1, padding=1)
         local_std = self._local_std(image_1024, k=5)
-        x = torch.cat([coarse_logits_1024, prob, image_1024, hf, local_std], dim=1)
+        return torch.cat([image_1024, high_frequency, local_std], dim=1)
+
+    def forward(
+        self,
+        coarse_logits_1024: torch.Tensor,
+        image_1024: torch.Tensor,
+        image_context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        prob = torch.sigmoid(coarse_logits_1024)
+        if image_context is None:
+            image_context = self.prepare_image_context(image_1024)
+        x = torch.cat([coarse_logits_1024, prob, image_context], dim=1)
         f = self.stem(x)
         f = self.blocks(f)
         delta = self.head(f)
@@ -268,7 +374,19 @@ def _load_checkpoint_non_strict(model: nn.Module, ckpt_path: str) -> None:
         return
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    model.load_state_dict(state, strict=False)
+    incompatible = model.load_state_dict(state, strict=False)
+    missing = list(incompatible.missing_keys)
+    unexpected = list(incompatible.unexpected_keys)
+    allowed = tuple('sam_mask_decoder.' + name for name in (
+        'dc1.', 'dc2.', 'ln1.', 'fuse_s0.', 'fuse_s1.',
+        'implicit_prompt_residual_scale', 'highres_gate_logit_'))
+    required_missing = [name for name in missing if not name.startswith(allowed)]
+    if required_missing or unexpected:
+        raise RuntimeError(f'Incompatible pretrained checkpoint: missing={required_missing}, unexpected={unexpected}')
+    print(
+        f"[checkpoint] loaded non-strictly from {ckpt_path} | "
+        f"missing={len(missing)} unexpected={len(unexpected)}"
+    )
 
 
 def build_trainable_modules(args, device: torch.device) -> Tuple[nn.Module, nn.Module, nn.Module, nn.Module]:
@@ -282,7 +400,7 @@ def build_trainable_modules(args, device: torch.device) -> Tuple[nn.Module, nn.M
     model = build_sam2(
         config_file=config_name,
         ckpt_path=None,
-        device=str(device),
+        device=device.type,
         mode="train",
         apply_postprocessing=False,
         hydra_overrides_extra=[],
@@ -294,14 +412,37 @@ def build_trainable_modules(args, device: torch.device) -> Tuple[nn.Module, nn.M
     freeze_all_params(model.image_encoder.neck)
 
     if args.use_lora:
-        apply_lora_to_hiera_qkv(model.image_encoder.trunk, r=args.lora_rank, alpha=args.lora_alpha)
+        wrapped = apply_lora_to_hiera_qkv(model.image_encoder.trunk, r=args.lora_rank, alpha=args.lora_alpha)
+        print(f"[LoRA] wrapped {wrapped} Hiera qkv layers (r={args.lora_rank}, alpha={args.lora_alpha})")
+    else:
+        print("[LoRA] disabled for this ablation preset")
 
     unfreeze_params(model.sam_mask_decoder)
+    highres_fusion_mode = str(
+        getattr(args, "highres_fusion_mode", "legacy_concat")
+    )
+    model.sam_mask_decoder.highres_fusion_mode = highres_fusion_mode
+    model.sam_mask_decoder.implicit_prompt_gate_floor = float(
+        getattr(args, "decoder_prompt_gate_floor", 0.0)
+    )
+    model.sam_mask_decoder.implicit_prompt_mode = str(
+        getattr(args, "implicit_prompt_mode", "multiplicative")
+    )
+    model.pgsam_normalize_inputs = bool(
+        getattr(args, "sam2_normalize_inputs", False)
+    )
+    model.pgsam_prompt_policy = getattr(args, "prompt_policy", "legacy")
+    model.pgsam_initial_implicit = getattr(args, "use_initial_implicit_prompt", None)
+    model.pgsam_final_implicit = getattr(args, "use_final_implicit_prompt", None)
+    model.pgsam_prompt_refinement = getattr(args, "prompt_refinement_mode", "global_local")
+    model.pgsam_point_conf_ratio = getattr(args, "point_confidence_ratio", .6)
+    model.pgsam_point_min_conf = getattr(args, "point_min_confidence", .5)
 
     stage4_channels = model.image_encoder.trunk.channel_list[0]
     sgn = SemanticGuidanceNeck(
         in_channels=stage4_channels,
         out_channels=model.sam_prompt_embed_dim,
+        use_layout_prior=bool(getattr(args, "use_layout_prior", False)),
     ).to(device)
     if args.prompt_source == "sgn_auto":
         unfreeze_params(sgn)
@@ -325,9 +466,33 @@ def build_trainable_modules(args, device: torch.device) -> Tuple[nn.Module, nn.M
                 stride=1,
             ).to(device)
 
+        # Both implementations remain instantiated so archived v4 checkpoints
+        # can still be loaded.  Only the branch used by the selected version is
+        # trainable, which also keeps optimizer diagnostics unambiguous.
+        if highres_fusion_mode == "residual_additive":
+            for legacy_name in ("dc1", "ln1", "dc2", "fuse_s0", "fuse_s1"):
+                legacy_module = getattr(model.sam_mask_decoder, legacy_name, None)
+                if legacy_module is not None:
+                    freeze_all_params(legacy_module)
+            active_s0 = args.highres_feature_mode in {"stage1", "stage1_stage2"}
+            active_s1 = args.highres_feature_mode in {"stage2", "stage1_stage2"}
+            if not active_s0:
+                freeze_all_params(model.sam_mask_decoder.conv_s0)
+                model.sam_mask_decoder.highres_gate_logit_s0.requires_grad = False
+            if not active_s1:
+                freeze_all_params(model.sam_mask_decoder.conv_s1)
+                model.sam_mask_decoder.highres_gate_logit_s1.requires_grad = False
+        elif highres_fusion_mode == "legacy_concat":
+            freeze_all_params(model.sam_mask_decoder.output_upscaling)
+            model.sam_mask_decoder.highres_gate_logit_s0.requires_grad = False
+            model.sam_mask_decoder.highres_gate_logit_s1.requires_grad = False
+        else:
+            raise ValueError(f"Unsupported high-resolution fusion mode: {highres_fusion_mode}")
+
     refiner = BoundaryRefinementModule(
         stage1_in_channels=model.sam_prompt_embed_dim,
         attn_dim=args.refine_attn_dim,
+        local_kernel=args.refine_local_kernel,
         downsample_ratio=args.refine_downsample_ratio,
         use_checkpoint=args.refine_use_checkpoint,
     ).to(device)
@@ -340,6 +505,7 @@ def build_trainable_modules(args, device: torch.device) -> Tuple[nn.Module, nn.M
         in_channels=7,
         hidden_channels=args.fullres_hidden_dim,
         num_blocks=args.fullres_blocks,
+        block_type=getattr(args, "fullres_block_type", "standard"),
     ).to(device)
     if args.use_fullres_refinement:
         unfreeze_params(full_res_refiner)

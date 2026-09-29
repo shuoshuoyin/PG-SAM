@@ -18,60 +18,6 @@ def _make_norm(num_channels: int) -> nn.Module:
     return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
 
 
-class BoxRegressor(nn.Module):
-    """
-    Predict normalized xyxy box coordinates from SGN bottleneck features.
-    """
-
-    def __init__(self, in_channels: int, hidden_channels: int) -> None:
-        super().__init__()
-        mid_channels = max(32, hidden_channels // 2)
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_channels, mid_channels),
-            nn.LayerNorm(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid_channels, 4),
-        )
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        raw_box = self.head(feats)  # (B,4)
-        norm_box = torch.sigmoid(raw_box)
-        x1 = torch.minimum(norm_box[:, 0], norm_box[:, 2])
-        y1 = torch.minimum(norm_box[:, 1], norm_box[:, 3])
-        x2 = torch.maximum(norm_box[:, 0], norm_box[:, 2])
-        y2 = torch.maximum(norm_box[:, 1], norm_box[:, 3])
-        return torch.stack([x1, y1, x2, y2], dim=1).clamp(0.0, 1.0)
-
-
-class PointRegressor(nn.Module):
-    """
-    Predict normalized center point (x, y) from SGN bottleneck features.
-    """
-
-    def __init__(self, in_channels: int, hidden_channels: int) -> None:
-        super().__init__()
-        mid_channels = max(32, hidden_channels // 2)
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_channels, mid_channels),
-            nn.LayerNorm(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Linear(mid_channels, 2),
-        )
-
-    def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.head(feats)).clamp(0.0, 1.0)
-
-
 class _SobelTextureEnergy(nn.Module):
     """
     Lightweight, parameter-free texture energy using Sobel gradients.
@@ -158,10 +104,11 @@ class SemanticGuidanceNeck(nn.Module):
     - ASPP-style multi-scale context extraction.
     - Texture density analyzer to emphasize high-density map areas over
       low-density legend boxes.
-    - Output:
-      1) a single-channel 64x64 heatmap (values in [0,1]) for main map region.
-      2) optionally, a normalized bounding box (xyxy in [0,1]) and a center point
-         (x,y in [0,1]) for auxiliary supervision.
+    - Output: a single-channel 64x64 main-map-area prior in [0, 1].
+
+    The optional layout branch is specific to page-level main-map extraction:
+    it encodes normalized location and distance to the page boundary instead of
+    regressing an object box. This keeps PGSAM's prompt generation box-free.
     """
 
     def __init__(
@@ -171,16 +118,14 @@ class SemanticGuidanceNeck(nn.Module):
         atrous_rates: Tuple[int, ...] = (2, 4, 6),
         aspp_branch_channels: Optional[int] = None,
         dropout: float = 0.0,
-        point_box_mix: float = 0.5,
+        use_layout_prior: bool = False,
     ) -> None:
         super().__init__()
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.atrous_rates = tuple(int(r) for r in atrous_rates)
         self.dropout = float(dropout)
-        self.point_box_mix = float(point_box_mix)
-        if not (0.0 <= self.point_box_mix <= 1.0):
-            raise ValueError("point_box_mix must be in [0, 1].")
+        self.use_layout_prior = bool(use_layout_prior)
 
         if aspp_branch_channels is None:
             # With N dilated branches + 1x1 + global pooling = (len(rates)+2) branches.
@@ -221,7 +166,17 @@ class SemanticGuidanceNeck(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        concat_channels = self.aspp_branch_channels * (len(self.atrous_rates) + 2)
+        self.layout_branch = None
+        if self.use_layout_prior:
+            self.layout_branch = nn.Sequential(
+                nn.Conv2d(3, self.aspp_branch_channels, kernel_size=1, bias=False),
+                _make_norm(self.aspp_branch_channels),
+                nn.ReLU(inplace=True),
+            )
+
+        concat_channels = self.aspp_branch_channels * (
+            len(self.atrous_rates) + 2 + int(self.use_layout_prior)
+        )
         self.aspp_fuse = nn.Sequential(
             nn.Conv2d(concat_channels, self.out_channels, kernel_size=1, bias=False),
             _make_norm(self.out_channels),
@@ -232,6 +187,11 @@ class SemanticGuidanceNeck(nn.Module):
 
         # Texture density analyzer (map texture vs legend boxes)
         self.texture_analyzer = _TextureDensityAnalyzer()
+        # The former hard product `semantic * density` could nearly erase the
+        # whole prior before SGN had learned anything, especially with 10-shot
+        # data. Keep texture as a learnable residual cue initialized to an
+        # identity mapping so the semantic branch always receives gradients.
+        self.texture_logit_scale = nn.Parameter(torch.tensor(0.0))
 
         # Predict an attention logits map, then gate with texture density.
         self.attention_head = nn.Sequential(
@@ -240,16 +200,6 @@ class SemanticGuidanceNeck(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(self.out_channels // 2, 1, kernel_size=1, bias=True),
         )
-        # BoxRegressor head over SGN bottleneck features.
-        self.box_regressor = BoxRegressor(
-            in_channels=self.out_channels,
-            hidden_channels=max(32, self.out_channels // 2),
-        )
-        self.point_regressor = PointRegressor(
-            in_channels=self.out_channels,
-            hidden_channels=max(32, self.out_channels // 2),
-        )
-
     def _get_stage4(self, x: Union[torch.Tensor, Iterable[torch.Tensor]]) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
             return x
@@ -267,14 +217,7 @@ class SemanticGuidanceNeck(nn.Module):
         self,
         stage4: Union[torch.Tensor, Iterable[torch.Tensor]],
         return_density_mask: bool = False,
-        return_box: bool = False,
-        return_point: bool = False,
-    ) -> Union[
-        torch.Tensor,
-        Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    ]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Args:
             stage4: (B, C, H, W) or a stage feature list/tuple, whose last element is Stage-4.
@@ -297,58 +240,36 @@ class SemanticGuidanceNeck(nn.Module):
             feats_global, size=(H, W), mode="bilinear", align_corners=False
         )
 
-        feats = torch.cat([feats_1x1, *feats_dilated, feats_global], dim=1)
+        branches = [feats_1x1, *feats_dilated, feats_global]
+        if self.layout_branch is not None:
+            y = torch.linspace(-1.0, 1.0, H, device=x.device, dtype=x.dtype)
+            x_coord = torch.linspace(-1.0, 1.0, W, device=x.device, dtype=x.dtype)
+            yy, xx = torch.meshgrid(y, x_coord, indexing="ij")
+            edge_distance = 1.0 - torch.maximum(xx.abs(), yy.abs())
+            layout = torch.stack([xx, yy, edge_distance], dim=0).unsqueeze(0)
+            layout = layout.expand(x.shape[0], -1, -1, -1)
+            branches.append(self.layout_branch(layout))
+
+        feats = torch.cat(branches, dim=1)
         feats = self.aspp_fuse(feats)  # (B, 256, H, W)
 
         # Texture density mask emphasizes map areas with higher texture density.
         density_mask = self.texture_analyzer(x)  # (B,1,H,W)
 
-        # Produce spatial attention and gate by texture density.
+        # Fuse semantic attention and texture density in logit space. A zero
+        # scale is exactly the semantic prediction; training can learn whether
+        # texture should enhance or suppress a location.
         attn_logits = self.attention_head(feats)  # (B,1,H,W)
-        spatial_attention = torch.sigmoid(attn_logits) * density_mask
-        spatial_attention = spatial_attention.clamp(0.0, 1.0)
-
-        # Predict optional geometry for auxiliary losses.
-        norm_box = None
-        norm_point = None
-        if return_box or return_point:
-            if return_box:
-                norm_box = self.box_regressor(feats)
-            if return_point:
-                norm_point_raw = self.point_regressor(feats)
-                if return_box:
-                    box_center = torch.stack(
-                        [
-                            0.5 * (norm_box[:, 0] + norm_box[:, 2]),
-                            0.5 * (norm_box[:, 1] + norm_box[:, 3]),
-                        ],
-                        dim=1,
-                    )
-                    # Couple point and box predictions to keep them consistent.
-                    norm_point = (
-                        (1.0 - self.point_box_mix) * norm_point_raw
-                        + self.point_box_mix * box_center
-                    )
-                else:
-                    norm_point = norm_point_raw
-                norm_point = norm_point.clamp(0.0, 1.0)
+        texture_residual = 2.0 * density_mask - 1.0
+        spatial_attention = torch.sigmoid(
+            attn_logits + torch.tanh(self.texture_logit_scale) * texture_residual
+        )
 
         # Standardize to a fixed 64x64 attention map for downstream decoder use.
         spatial_attention = F.interpolate(
             spatial_attention, size=(64, 64), mode="bilinear", align_corners=False
         )
 
-        if return_density_mask and return_box and return_point:
-            return spatial_attention, density_mask, norm_box, norm_point
-        if return_density_mask and return_box:
-            return spatial_attention, density_mask, norm_box
         if return_density_mask:
             return spatial_attention, density_mask
-        if return_box and return_point:
-            return spatial_attention, norm_box, norm_point
-        if return_box:
-            return spatial_attention, norm_box
-        if return_point:
-            return spatial_attention, norm_point
         return spatial_attention
-

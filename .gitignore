@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 .pytest_cache/
 pg_sam_inference.egg-info/
+outputs/
 
 # SAM2 base checkpoints are downloaded by users from the official source.
 checkpoints/sam2*.pt
